@@ -1,0 +1,312 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Chapter 1. Easy Concurrency with the Task Module
+
+## Sender
+
+```elixir
+defmodule Sender do
+  def send_email(email, time \\ 3000)
+
+  def send_email("byebye@world.com" = email, _),
+    do: raise("Oops, coldn't send email to #{email}!")
+
+  def send_email(email, time) do
+    Process.sleep(time)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+end
+
+emails = [
+  "hello@world.com",
+  "hola@world.com",
+  "nihao@world.com",
+  "konichiwa@world.com"
+]
+```
+
+```output
+["hello@world.com", "hola@world.com", "nihao@world.com", "konichiwa@world.com"]
+```
+
+```elixir
+Sender.send_email("hello@world.com")
+```
+
+```output
+Email to hello@world.com sent
+```
+
+```output
+{:ok, "email_sent"}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Sync
+
+```elixir
+Sender.send_email("hello@world.com")
+```
+
+```output
+Email to hello@world.com sent
+```
+
+```output
+{:ok, "email_sent"}
+```
+
+```elixir
+defmodule Notifier.Sync do
+  def notify_all(emails) do
+    Enum.each(emails, &Sender.send_email/1)
+  end
+end
+```
+
+```output
+{:module, Notifier.Sync, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:notify_all, 1}}
+```
+
+```elixir
+Notifier.Sync.notify_all(emails)
+```
+
+```output
+Email to hello@world.com sent
+Email to hola@world.com sent
+Email to nihao@world.com sent
+Email to konichiwa@world.com sent
+```
+
+```output
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Async
+
+```elixir
+defmodule Notifier.Async do
+  def notify_all(emails) do
+    Enum.each(emails, fn email ->
+      Task.start(fn -> Sender.send_email(email) end)
+    end)
+  end
+end
+```
+
+```output
+{:module, Notifier.Async, <<70, 79, 82, 49, 0, 0, 7, ...>>, {:notify_all, 1}}
+```
+
+```elixir
+Notifier.Async.notify_all(emails)
+```
+
+```output
+:ok
+```
+
+```output
+Email to hello@world.com sent
+Email to hola@world.com sent
+Email to nihao@world.com sent
+Email to konichiwa@world.com sent
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Task.async/1 & Task.await/1 vs Task.yield/1
+
+```elixir
+task_await = Task.async(fn -> Sender.send_email("hello@world.com", 6000) end)
+
+# raises after 5s
+Task.await(task_await)
+```
+
+```elixir
+task_yield = Task.async(fn -> Sender.send_email("hello@world.com", 6000) end)
+
+# returns nil after 5s
+Task.yield(task_yield) |> IO.inspect()
+
+Process.sleep(1000)
+
+# returns {:ok, "email_sent"} after 6s
+Task.yield(task_yield) |> IO.inspect()
+
+# returns nil after yield
+Task.yield(task_yield) |> IO.inspect()
+```
+
+```output
+nil
+Email to hello@world.com sent
+{:ok, {:ok, "email_sent"}}
+nil
+```
+
+```output
+nil
+```
+
+```elixir
+defmodule Notifier.AsyncAwait do
+  def notify_all(emails) do
+    Enum.map(emails, fn email ->
+      Task.async(fn -> Sender.send_email(email) end)
+    end)
+    |> Enum.map(&Task.await/1)
+  end
+end
+```
+
+```output
+
+18:57:30.438 [error] Livebook.Evaluator #PID<0.140.0> received unexpected message in handle_info/2: {#Reference<0.2905002171.1421082632.106230>, {:ok, "email_sent"}}
+
+
+```
+
+```output
+{:module, Notifier.AsyncAwait, <<70, 79, 82, 49, 0, 0, 7, ...>>, {:notify_all, 1}}
+```
+
+```elixir
+Notifier.AsyncAwait.notify_all(emails)
+```
+
+```output
+Email to hello@world.com sent
+Email to hola@world.com sent
+Email to nihao@world.com sent
+Email to konichiwa@world.com sent
+```
+
+```output
+[ok: "email_sent", ok: "email_sent", ok: "email_sent", ok: "email_sent"]
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Stream
+
+```elixir
+stream = Stream.map([1, 2, 3], &(&1 * 2)) |> IO.inspect()
+
+stream |> Enum.to_list()
+```
+
+```output
+#Stream<[enum: [1, 2, 3], funs: [#Function<47.58486609/1 in Stream.map/2>]]>
+[2, 4, 6]
+```
+
+```output
+[2, 4, 6]
+```
+
+```elixir
+defmodule Notifier.Stream do
+  def notify_all(emails) do
+    emails
+    |> Task.async_stream(&Sender.send_email/1, max_concurrency: 3, order: false)
+    |> Enum.to_list()
+  end
+end
+```
+
+```output
+{:module, Notifier.Stream, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:notify_all, 1}}
+```
+
+```elixir
+Notifier.Stream.notify_all(emails)
+```
+
+```output
+Email to hello@world.com sent
+Email to hola@world.com sent
+Email to nihao@world.com sent
+Email to konichiwa@world.com sent
+```
+
+```output
+[ok: {:ok, "email_sent"}, ok: {:ok, "email_sent"}, ok: {:ok, "email_sent"}, ok: {:ok, "email_sent"}]
+```
+
+## Supervisor
+
+```elixir
+children = [
+  {Task.Supervisor, name: Sender.EmailTaskSupervisor}
+]
+
+opts = [strategy: :one_for_one, name: Sender.Supervisor]
+
+Supervisor.start_link(children, opts)
+```
+
+```output
+{:ok, #PID<0.301.0>}
+```
+
+```elixir
+will_raise_email = ["byebye@world.com" | emails]
+
+# This line will brake livebook
+# Notifier.Stream.notify_all(will_raise_email)
+```
+
+```output
+["byebye@world.com", "hello@world.com", "hola@world.com", "nihao@world.com", "konichiwa@world.com"]
+```
+
+```elixir
+defmodule Notifier.StreamSupervisor do
+  def notify_all(emails) do
+    Sender.EmailTaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(emails, &Sender.send_email/1,
+      max_concurrency: 3,
+      order: false
+    )
+    |> Enum.to_list()
+  end
+end
+```
+
+```output
+{:module, Notifier.StreamSupervisor, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:notify_all, 1}}
+```
+
+```elixir
+Notifier.StreamSupervisor.notify_all(will_raise_email)
+```
+
+```output
+Email to hello@world.com sent
+Email to hola@world.com sent
+Email to nihao@world.com sent
+Email to konichiwa@world.com sent
+```
+
+```output
+[
+  exit: {%RuntimeError{message: "Oops, coldn't send email to byebye@world.com!"},
+   [
+     {Sender, :send_email, 2, [file: 'notebook.livemd#cell', line: 5]},
+     {Task.Supervised, :invoke_mfa, 2, [file: 'lib/task/supervised.ex', line: 90]},
+     {Task.Supervised, :reply, 5, [file: 'lib/task/supervised.ex', line: 35]},
+     {:proc_lib, :init_p_do_apply, 3, [file: 'proc_lib.erl', line: 226]}
+   ]},
+  ok: {:ok, "email_sent"},
+  ok: {:ok, "email_sent"},
+  ok: {:ok, "email_sent"},
+  ok: {:ok, "email_sent"}
+]
+```
