@@ -1,0 +1,410 @@
+# Chapter 2. Long-Running Processes Using GenServer
+
+## Common
+
+```elixir
+defmodule Sender do
+  def send_email("konnichiwa@world.com" = _email) do
+    :error
+  end
+
+  def send_email(email) do
+    Process.sleep(3000)
+    IO.puts("Email to #{email} sent")
+
+    {:ok, :email_sent}
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## GenServer
+
+```elixir
+defmodule SendServer do
+  use GenServer
+
+  def init(args) do
+    max_retries = Keyword.get(args, :max_retries, 5)
+    state = %{emails: [], max_retries: max_retries}
+
+    Process.send_after(self(), :retry, 5000)
+
+    {:ok, state}
+  end
+
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
+  end
+
+  def handle_cast({:send, email}, %{emails: emails} = state) do
+    status =
+      case Sender.send_email(email) do
+        {:ok, :email_sent} -> :sent
+        :error -> :failed
+      end
+
+    emails = [%{email: email, status: status, retries: 0} | emails]
+
+    {:noreply, %{state | emails: emails}}
+  end
+
+  def handle_info(:retry, %{emails: emails, max_retries: max_retries} = state) do
+    {should_be_retried, done} =
+      Enum.split_with(emails, fn item ->
+        item.status == :failed && item.retries < max_retries
+      end)
+
+    retried =
+      Enum.map(should_be_retried, fn item ->
+        IO.puts("Retrying email #{item.email}")
+
+        new_status =
+          case Sender.send_email(item.email) do
+            {:ok, :email_sent} -> :sent
+            :error -> :failed
+          end
+
+        %{email: item.email, status: new_status, retries: item.retries + 1}
+      end)
+
+    Process.send_after(self(), :retry, 5000)
+
+    {:noreply, %{state | emails: retried ++ done}}
+  end
+
+  def terminate(reason, _state) do
+    IO.puts("Terminating with reason #{reason}")
+  end
+end
+```
+
+```elixir
+{:ok, pid} = GenServer.start(SendServer, max_retries: 2)
+
+GenServer.call(pid, :get_state) |> IO.inspect()
+
+GenServer.cast(pid, {:send, "hello@world.com"})
+
+GenServer.cast(pid, {:send, "konnichiwa@world.com"})
+
+GenServer.call(pid, :get_state) |> IO.inspect()
+
+Process.sleep(10000)
+
+GenServer.call(pid, :get_state) |> IO.inspect()
+
+GenServer.stop(pid)
+```
+
+## Job Processing System
+
+```elixir
+good_job = fn ->
+  Process.sleep(1000)
+  {:ok, []}
+end
+
+bad_job = fn ->
+  Process.sleep(1000)
+  :error
+end
+
+doomed_job = fn ->
+  Process.sleep(1000)
+  raise "Boom!"
+end
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## V1
+
+```elixir
+defmodule Job.V1 do
+  use GenServer, restart: :transient
+  require Logger
+
+  defstruct [:work, :id, :max_retries, retries: 0, status: :new]
+
+  def start_link(args) do
+    GenServer.start_link(__MODULE__, args)
+  end
+
+  def init(args) do
+    work = Keyword.fetch!(args, :work)
+    id = Keyword.get(args, :id, random_job_id())
+    max_retries = Keyword.get(args, :max_retries, 3)
+
+    state = %__MODULE__{id: id, work: work, max_retries: max_retries}
+
+    {:ok, state, {:continue, :run}}
+  end
+
+  def handle_continue(:run, state) do
+    new_state = state.work.() |> handle_job_result(state)
+
+    case new_state.status do
+      :errored ->
+        Process.send_after(self(), :retry, 1000)
+        {:noreply, new_state}
+
+      _ ->
+        Logger.info("Job exiting #{state.id}")
+        {:stop, :normal, new_state}
+    end
+  end
+
+  def handle_info(:retry, state) do
+    {:noreply, state, {:continue, :run}}
+  end
+
+  defp handle_job_result({:ok, _data}, state) do
+    Logger.info("Job completed #{state.id}")
+
+    %__MODULE__{state | status: :done}
+  end
+
+  defp handle_job_result(:error, %{status: :new} = state) do
+    Logger.warn("Job errored #{state.id}")
+
+    %__MODULE__{state | status: :errored}
+  end
+
+  defp handle_job_result(:error, %{status: :errored, max_retries: max_retries} = state) do
+    Logger.warn("Job retry failed #{state.id}")
+
+    new_retries = state.retries + 1
+
+    case new_retries do
+      ^max_retries ->
+        %__MODULE__{state | status: :failed}
+
+      _ ->
+        %__MODULE__{state | retries: new_retries}
+    end
+  end
+
+  defp random_job_id() do
+    :crypto.strong_rand_bytes(5) |> Base.url_encode64(padding: false)
+  end
+end
+```
+
+```elixir
+GenServer.start(Job.V1, work: good_job)
+GenServer.start(Job.V1, work: bad_job)
+```
+
+```elixir
+defmodule Application.V1 do
+  def start_link() do
+    spec = {
+      DynamicSupervisor,
+      strategy: :one_for_one, max_seconds: 30, name: JobRunner.V1
+    }
+
+    Supervisor.start_link([spec], strategy: :one_for_one, name: AppSupervisor.V1)
+  end
+end
+
+Application.V1.start_link()
+```
+
+```elixir
+defmodule Jobber.V1 do
+  def start_job(args) do
+    DynamicSupervisor.start_child(JobRunner.V1, {Job.V1, args})
+  end
+end
+```
+
+```elixir
+Jobber.V1.start_job(work: good_job)
+Jobber.V1.start_job(work: bad_job)
+```
+
+```elixir
+Process.whereis(JobRunner.V1) |> IO.inspect()
+
+Jobber.V1.start_job(
+  work: fn ->
+    Process.sleep(1000)
+    raise "Boom!"
+  end
+)
+
+Process.sleep(5000)
+
+Process.whereis(JobRunner.V1) |> IO.inspect()
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## V2
+
+```elixir
+defmodule Application.V2 do
+  def start_link() do
+    children = [
+      {Registry, keys: :unique, name: JobRegistry.V2},
+      {DynamicSupervisor, strategy: :one_for_one, max_seconds: 30, name: JobRunner.V2}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: AppSupervisor.V2)
+  end
+end
+
+Application.V2.start_link()
+```
+
+```elixir
+defmodule JobSupervisor.V2 do
+  use Supervisor, restart: :temporary
+
+  def start_link(args) do
+    Supervisor.start_link(__MODULE__, args)
+  end
+
+  def init(args) do
+    children = [
+      {Job.V2, args}
+    ]
+
+    options = [
+      strategy: :one_for_one,
+      max_seconds: 30
+    ]
+
+    Supervisor.init(children, options)
+  end
+end
+```
+
+```elixir
+defmodule Jobber.V2 do
+  def start_job(args) do
+    case Enum.count(running_imports()) do
+      count when count >= 5 -> {:error, :import_quota_reached}
+      _ -> DynamicSupervisor.start_child(JobRunner.V2, {JobSupervisor.V2, args})
+    end
+  end
+
+  def running_imports() do
+    match_all = {:"$1", :"$2", :"$3"}
+    guards = [{:==, :"$3", "import"}]
+    map_result = [%{id: :"$1", pid: :"$2", type: :"$3"}]
+
+    Registry.select(JobRegistry.V2, [{match_all, guards, map_result}])
+  end
+end
+```
+
+```elixir
+defmodule Job.V2 do
+  use GenServer, restart: :transient
+  require Logger
+
+  defstruct [:work, :id, :max_retries, retries: 0, status: :new]
+
+  def start_link(args) do
+    args =
+      case Keyword.has_key?(args, :id) do
+        true -> args
+        false -> Keyword.put(args, :id, random_job_id())
+      end
+
+    id = Keyword.get(args, :id)
+    type = Keyword.get(args, :type)
+
+    GenServer.start_link(__MODULE__, args, name: via(id, type))
+  end
+
+  def init(args) do
+    work = Keyword.fetch!(args, :work)
+    id = Keyword.get(args, :id, random_job_id())
+    max_retries = Keyword.get(args, :max_retries, 3)
+
+    state = %__MODULE__{id: id, work: work, max_retries: max_retries}
+
+    {:ok, state, {:continue, :run}}
+  end
+
+  def handle_continue(:run, state) do
+    new_state = state.work.() |> handle_job_result(state)
+
+    case new_state.status do
+      :errored ->
+        Process.send_after(self(), :retry, 1000)
+        {:noreply, new_state}
+
+      _ ->
+        Logger.info("Job exiting #{state.id}")
+        {:stop, :normal, new_state}
+    end
+  end
+
+  def handle_info(:retry, state) do
+    {:noreply, state, {:continue, :run}}
+  end
+
+  defp handle_job_result({:ok, _data}, state) do
+    Logger.info("Job completed #{state.id}")
+
+    %__MODULE__{state | status: :done}
+  end
+
+  defp handle_job_result(:error, %{status: :new} = state) do
+    Logger.warn("Job errored #{state.id}")
+
+    %__MODULE__{state | status: :errored}
+  end
+
+  defp handle_job_result(:error, %{status: :errored, max_retries: max_retries} = state) do
+    Logger.warn("Job retry failed #{state.id}")
+
+    new_retries = state.retries + 1
+
+    case new_retries do
+      ^max_retries ->
+        %__MODULE__{state | status: :failed}
+
+      _ ->
+        %__MODULE__{state | retries: new_retries}
+    end
+  end
+
+  defp random_job_id() do
+    :crypto.strong_rand_bytes(5) |> Base.url_encode64(padding: false)
+  end
+
+  defp via(id, type) do
+    {:via, Registry, {JobRegistry.V2, id, type}}
+  end
+end
+```
+
+```elixir
+Process.whereis(JobRunner.V2) |> IO.inspect()
+
+Jobber.V2.start_job(work: doomed_job)
+
+Process.whereis(JobRunner.V2) |> IO.inspect()
+```
+
+```elixir
+long_job = fn ->
+  Process.sleep(5000)
+  {:ok, []}
+end
+
+Jobber.V2.start_job(work: long_job, type: "import")
+Jobber.V2.start_job(work: long_job, type: "send_email")
+Jobber.V2.start_job(work: long_job, type: "import")
+Jobber.V2.start_job(work: long_job, type: "import")
+Jobber.V2.start_job(work: long_job, type: "import") |> IO.inspect()
+Jobber.V2.start_job(work: long_job, type: "import") |> IO.inspect()
+
+Jobber.V2.running_imports()
+```
