@@ -1,0 +1,190 @@
+# Chapter 4. Processing Collections with Flow
+
+## Common
+
+```elixir
+Mix.install([
+  {:flow, "~> 1.1"},
+  {:nimble_csv, "~> 1.1"}
+])
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Flow
+
+```elixir
+defmodule Airports.Benchmark do
+  alias NimbleCSV.RFC4180, as: CSV
+
+  def list_open_airports() do
+    airpots_csv_path()
+    |> File.read!()
+    |> CSV.parse_string()
+    |> Enum.map(fn row ->
+      %{
+        id: Enum.at(row, 0),
+        type: Enum.at(row, 2),
+        name: Enum.at(row, 3),
+        country: Enum.at(row, 8)
+      }
+    end)
+    |> Enum.reject(&(&1.type == "closed"))
+  end
+
+  def list_open_airports_with_stream() do
+    airpots_csv_path()
+    |> File.stream!()
+    |> CSV.parse_stream()
+    |> Stream.map(fn row ->
+      %{
+        id: Enum.at(row, 0),
+        type: Enum.at(row, 2),
+        name: Enum.at(row, 3),
+        country: Enum.at(row, 8)
+      }
+    end)
+    |> Stream.reject(&(&1.type == "closed"))
+    |> Enum.to_list()
+  end
+
+  def list_open_airports_with_flow() do
+    airpots_csv_path()
+    |> File.stream!()
+    |> Flow.from_enumerable()
+    |> Flow.map(fn line ->
+      [row] = CSV.parse_string(line, skip_headers: false)
+
+      %{
+        id: Enum.at(row, 0),
+        type: Enum.at(row, 2),
+        name: Enum.at(row, 3),
+        country: Enum.at(row, 8)
+      }
+    end)
+    |> Flow.reject(&(&1.type == "closed"))
+    |> Enum.to_list()
+  end
+
+  defp airpots_csv_path() do
+    "./data/airports.csv"
+  end
+end
+```
+
+```elixir
+{time, _} = :timer.tc(&Airports.Benchmark.list_open_airports/0)
+{time_stream, _} = :timer.tc(&Airports.Benchmark.list_open_airports_with_stream/0)
+{time_flow, _} = :timer.tc(&Airports.Benchmark.list_open_airports_with_flow/0)
+
+time |> IO.inspect()
+time_stream |> IO.inspect()
+time_flow |> IO.inspect()
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Partitioning
+
+```elixir
+defmodule Airports.Partition do
+  alias NimbleCSV.RFC4180, as: CSV
+
+  def sort_count_of_open_airports_by_country(type) when type in [:reduce, :group_by] do
+    airpots_csv_path()
+    |> File.stream!()
+    |> Flow.from_enumerable()
+    |> Flow.map(fn line ->
+      [row] = CSV.parse_string(line, skip_headers: false)
+
+      %{
+        id: Enum.at(row, 0),
+        type: Enum.at(row, 2),
+        name: Enum.at(row, 3),
+        country: Enum.at(row, 8)
+      }
+    end)
+    |> Flow.reject(&(&1.type == "closed"))
+    |> Flow.partition(key: {:key, :country})
+    |> group_by_with(type)
+    |> Flow.take_sort(10, fn {_, a}, {_, b} -> a > b end)
+    |> Enum.to_list()
+    |> List.flatten()
+  end
+
+  defp group_by_with(flow, :reduce) do
+    flow
+    |> Flow.reduce(fn -> %{} end, fn item, acc ->
+      Map.update(acc, item.country, 1, &(&1 + 1))
+    end)
+  end
+
+  defp group_by_with(flow, :group_by) do
+    flow
+    |> Flow.group_by(& &1.country)
+    |> Flow.map(fn {country, data} ->
+      {country, Enum.count(data)}
+    end)
+  end
+
+  defp airpots_csv_path() do
+    "./data/airports.csv"
+  end
+end
+```
+
+```elixir
+Airports.Partition.sort_count_of_open_airports_by_country(:reduce)
+Airports.Partition.sort_count_of_open_airports_by_country(:group_by)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Window and Trigger
+
+```elixir
+defmodule Airports.Window do
+  alias NimbleCSV.RFC4180, as: CSV
+
+  def count_of_open_airports_by_country() do
+    window = Flow.Window.global() |> Flow.Window.trigger_every(1000)
+
+    airpots_csv_path()
+    |> File.stream!()
+    |> Flow.from_enumerable()
+    |> Flow.map(fn line ->
+      [row] = CSV.parse_string(line, skip_headers: false)
+
+      %{
+        id: Enum.at(row, 0),
+        type: Enum.at(row, 2),
+        name: Enum.at(row, 3),
+        country: Enum.at(row, 8)
+      }
+    end)
+    |> Flow.reject(&(&1.type == "closed"))
+    |> Flow.partition(window: window, key: {:key, :country})
+    |> Flow.group_by(& &1.country)
+    |> Flow.on_trigger(fn acc, _partition_info, {_type, _id, trigger} ->
+      events =
+        acc
+        |> Enum.map(fn {country, data} -> {country, Enum.count(data)} end)
+        |> IO.inspect(label: inspect(self()))
+
+      case trigger do
+        :done -> {events, acc}
+        {:every, 1000} -> {[], acc}
+      end
+    end)
+    |> Enum.to_list()
+  end
+
+  defp airpots_csv_path() do
+    "./data/airports.csv"
+  end
+end
+```
+
+```elixir
+Airports.Window.count_of_open_airports_by_country()
+```
