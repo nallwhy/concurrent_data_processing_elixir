@@ -1,0 +1,287 @@
+# Chapter 3. Data-Processing Pipelines with GenStage
+
+## Common
+
+```elixir
+Mix.install([
+  {:gen_stage, "~> 1.0"}
+])
+```
+
+```elixir
+defmodule Scraper do
+  def work() do
+    1..5
+    |> Enum.random()
+    |> :timer.seconds()
+    |> Process.sleep()
+  end
+
+  def online?(_url) do
+    work()
+
+    Enum.random([false, true, true])
+  end
+end
+```
+
+```elixir
+pages = [
+  "google.com",
+  "facebook.com",
+  "apple.com",
+  "netflix.com",
+  "amazon.com"
+]
+```
+
+## GenStage
+
+```elixir
+defmodule PageProducer do
+  use GenStage
+  require Logger
+
+  def start_link(_args) do
+    init_state = []
+    GenStage.start_link(__MODULE__, init_state, name: __MODULE__)
+  end
+
+  def scrape_pages(pages) when is_list(pages) do
+    GenStage.cast(__MODULE__, {:pages, pages})
+  end
+
+  def init(state) do
+    Logger.info("#{__MODULE__} init")
+
+    {:producer, state}
+  end
+
+  def handle_demand(demand, state) do
+    Logger.info("#{__MODULE__} received demand for #{demand} pages")
+
+    events = []
+
+    {:noreply, events, state}
+  end
+
+  def handle_cast({:pages, pages}, state) do
+    {:noreply, pages, state}
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## V1
+
+```elixir
+defmodule PageConsumer.V1 do
+  use GenStage
+  require Logger
+
+  def start_link(_args) do
+    init_state = []
+    GenStage.start_link(__MODULE__, init_state)
+  end
+
+  def init(state) do
+    Logger.info("#{__MODULE__} init")
+
+    subscription = [
+      {PageProducer, min_demand: 0, max_demand: 1}
+    ]
+
+    {:consumer, state, subscribe_to: subscription}
+  end
+
+  def handle_events(events, _from, state) do
+    Logger.info("#{__MODULE__} recieved #{inspect(events)}")
+
+    Enum.each(events, fn _page -> Scraper.work() end)
+
+    {:noreply, [], state}
+  end
+end
+```
+
+```elixir
+children = [
+  PageProducer,
+  Supervisor.child_spec(PageConsumer.V1, id: :consumer_a),
+  Supervisor.child_spec(PageConsumer.V1, id: :consumer_b)
+]
+
+Supervisor.start_link(children, strategy: :one_for_one, name: Scraper.Supervisor.V1)
+```
+
+```elixir
+PageProducer.scrape_pages(pages)
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## V2: ConsumerSupervisor
+
+```elixir
+defmodule PageConsumerSupervisor.V2 do
+  use ConsumerSupervisor
+  require Logger
+
+  def start_link(_args) do
+    ConsumerSupervisor.start_link(__MODULE__, :ok)
+  end
+
+  def init(_args) do
+    Logger.info("PageConsumerSupervisor init")
+
+    children = [
+      %{
+        id: PageConsumer.V2,
+        start: {PageConsumer.V2, :start_link, []},
+        restart: :transient
+      }
+    ]
+
+    opts = [
+      strategy: :one_for_one,
+      subscribe_to: [
+        {PageProducer, max_demand: 2}
+      ]
+    ]
+
+    ConsumerSupervisor.init(children, opts)
+  end
+end
+```
+
+```elixir
+defmodule PageConsumer.V2 do
+  require Logger
+
+  def start_link(event) do
+    Logger.info("#{__MODULE__} recieved #{inspect(event)}")
+
+    Task.start_link(fn -> Scraper.work() end)
+  end
+end
+```
+
+```elixir
+children = [
+  PageProducer,
+  PageConsumerSupervisor.V2
+]
+
+Supervisor.start_link(children, strategy: :one_for_one, name: Scraper.Supervisor.V2)
+```
+
+```elixir
+PageProducer.scrape_pages(pages)
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## V3: ProducerConsumer
+
+```elixir
+defmodule OnlinePageProducerConsumer.V3 do
+  use GenStage
+  require Logger
+
+  def start_link(id) do
+    init_state = []
+
+    GenStage.start_link(__MODULE__, init_state, name: via(id))
+  end
+
+  def init(state) do
+    Logger.info("#{__MODULE__} init")
+
+    subscription = [
+      {PageProducer, min_demand: 0, max_demand: 1}
+    ]
+
+    {:producer_consumer, state, subscribe_to: subscription}
+  end
+
+  def handle_events(events, _from, state) do
+    Logger.info("#{__MODULE__} received #{inspect(events)}")
+
+    events = Enum.filter(events, &Scraper.online?/1)
+
+    {:noreply, events, state}
+  end
+
+  def via(id) do
+    {:via, Registry, {OnlinePageProducerConsumerRegistry.V3, id}}
+  end
+end
+```
+
+```elixir
+defmodule PageConsumerSupervisor.V3 do
+  use ConsumerSupervisor
+  require Logger
+
+  def start_link(_args) do
+    ConsumerSupervisor.start_link(__MODULE__, :ok)
+  end
+
+  def init(_args) do
+    Logger.info("PageConsumerSupervisor init")
+
+    children = [
+      %{
+        id: PageConsumer.V3,
+        start: {PageConsumer.V3, :start_link, []},
+        restart: :transient
+      }
+    ]
+
+    opts = [
+      strategy: :one_for_one,
+      subscribe_to: [
+        {OnlinePageProducerConsumer.V3.via("online_page_producer_consumer_1"), max_demand: 2},
+        {OnlinePageProducerConsumer.V3.via("online_page_producer_consumer_2"), max_demand: 2}
+      ]
+    ]
+
+    ConsumerSupervisor.init(children, opts)
+  end
+end
+```
+
+```elixir
+defmodule PageConsumer.V3 do
+  require Logger
+
+  def start_link(event) do
+    Logger.info("#{__MODULE__} recieved #{inspect(event)}")
+
+    Task.start_link(fn -> Scraper.work() end)
+  end
+end
+```
+
+```elixir
+make_online_page_producer_consumer_spec = fn id ->
+  id = "online_page_producer_consumer_#{id}"
+
+  Supervisor.child_spec({OnlinePageProducerConsumer.V3, id}, id: id)
+end
+
+children = [
+  {Registry, keys: :unique, name: OnlinePageProducerConsumerRegistry.V3},
+  PageProducer,
+  make_online_page_producer_consumer_spec.(1),
+  make_online_page_producer_consumer_spec.(2),
+  PageConsumerSupervisor.V3
+]
+
+Supervisor.start_link(children, strategy: :one_for_one, name: Scraper.Supervisor.V3)
+```
+
+```elixir
+PageProducer.scrape_pages(pages)
+```
