@@ -1,0 +1,239 @@
+# Chapter 5. Data-Ingestion Pipelines with Broadway
+
+## Common
+
+```elixir
+Mix.install([
+  {:broadway, "~> 0.6.2"},
+  {:broadway_rabbitmq, "~> 0.6.5"},
+  {:amqp, "~> 1.6"}
+])
+```
+
+## Broadway
+
+```elixir
+defmodule BookingPipeline do
+  use Broadway
+
+  @producer BroadwayRabbitMQ.Producer
+  @producer_config [
+    queue: "bookings_queue",
+    declare: [durable: true],
+    on_failure: :reject_and_requeue
+  ]
+
+  def start_link(_args) do
+    options = [
+      name: __MODULE__,
+      producer: [module: {@producer, @producer_config}],
+      processors: [
+        default: []
+      ],
+      batchers: [
+        cinema: [],
+        musical: [],
+        default: []
+      ]
+    ]
+
+    Broadway.start_link(__MODULE__, options)
+  end
+
+  def prepare_messages(messages, _context) do
+    messages =
+      messages
+      |> Enum.map(fn message ->
+        Broadway.Message.update_data(message, fn data ->
+          [event, user_id] = String.split(data, ",")
+          %{event: event, user_id: user_id}
+        end)
+      end)
+
+    users = Tickets.users_by_ids(Enum.map(messages, & &1.data.user_id))
+
+    messages
+    |> Enum.map(fn message ->
+      Broadway.Message.update_data(message, fn data ->
+        user = Enum.find(users, &(&1.id == data.user_id))
+        Map.put(data, :user, user)
+      end)
+    end)
+  end
+
+  def handle_message(_processor, %Broadway.Message{} = message, _context) do
+    IO.inspect(message, label: "Message")
+
+    %{data: %{event: event}} = message
+
+    case Tickets.tickets_available?(event) do
+      true ->
+        case event do
+          "cinema" ->
+            Broadway.Message.put_batcher(message, :cinema)
+
+          "musical" ->
+            Broadway.Message.put_batcher(message, :musical)
+
+          _ ->
+            message
+        end
+
+      false ->
+        Broadway.Message.failed(message, "bookings-closed")
+    end
+  end
+
+  def handle_batch(_batcher, messages, %Broadway.BatchInfo{} = batch_info, _context) do
+    IO.inspect(batch_info,
+      label: "#{inspect(self())} Batch #{batch_info.batcher} #{batch_info.batch_key}"
+    )
+
+    messages
+    |> Tickets.insert_all_tickets()
+    |> Enum.each(fn message ->
+      channel = message.metadata.amqp_channel
+      payload = "email,#{message.data.user.email}"
+
+      AMQP.Basic.publish(channel, "", "notifications_queue", payload)
+    end)
+
+    messages
+  end
+
+  def handle_failed(messages, _context) do
+    IO.inspect(messages, label: "Failed messages")
+
+    messages
+    |> Enum.map(fn
+      %{status: {:failed, "bookings-closed"}} = message ->
+        Broadway.Message.configure_ack(message, on_failure: :reject)
+
+      message ->
+        message
+    end)
+  end
+end
+```
+
+```elixir
+defmodule NotificationPipeline do
+  use Broadway
+
+  @producer BroadwayRabbitMQ.Producer
+  @producer_config [
+    queue: "notifications_queue",
+    declare: [durable: true],
+    on_failure: :reject_and_requeue,
+    qos: [prefetch_count: 100]
+  ]
+
+  def start_link(_args) do
+    options = [
+      name: __MODULE__,
+      producer: [module: {@producer, @producer_config}],
+      processors: [
+        default: []
+      ],
+      batchers: [
+        email: [concurrency: 5, batch_timeout: 10_000]
+      ]
+    ]
+
+    Broadway.start_link(__MODULE__, options)
+  end
+
+  def prepare_messages(messages, _context) do
+    messages
+    |> Enum.map(fn message ->
+      Broadway.Message.update_data(message, fn data ->
+        [type, recipient] = String.split(data, ",")
+        %{type: type, recipient: recipient}
+      end)
+    end)
+  end
+
+  def handle_message(_processor, message, _context) do
+    message
+    |> Broadway.Message.put_batcher(:email)
+    |> Broadway.Message.put_batch_key(message.data.recipient)
+  end
+
+  def handle_batch(_batcher, messages, batch_info, _context) do
+    IO.inspect(batch_info,
+      label: "#{inspect(self())} Batch #{batch_info.batcher} #{batch_info.batch_key}"
+    )
+
+    messages
+  end
+end
+```
+
+```elixir
+children = [
+  BookingPipeline,
+  NotificationPipeline
+]
+
+opts = [strategy: :one_for_one, name: Tickets.Supervisor]
+
+Supervisor.start_link(children, opts)
+```
+
+```elixir
+defmodule Tickets do
+  # def tickets_available?("cinema") do
+  #   Process.sleep(Enum.random(100..200))
+  #   false
+  # end
+
+  def tickets_available?(_event) do
+    Process.sleep(Enum.random(100..200))
+    true
+  end
+
+  def create_ticket(_user, _event) do
+    Process.sleep(Enum.random(250..1000))
+  end
+
+  def send_email(_user) do
+    Process.sleep(Enum.random(100..250))
+  end
+
+  @users [
+    %{id: "1", email: "foo@email.com"},
+    %{id: "2", email: "bar@email.com"},
+    %{id: "3", email: "baz@email.com"}
+  ]
+
+  def users_by_ids(ids) when is_list(ids) do
+    Enum.filter(@users, &(&1.id in ids))
+  end
+
+  def insert_all_tickets(messages) do
+    Process.sleep(Enum.count(messages) * 250)
+    messages
+  end
+end
+```
+
+```elixir
+send_messages = fn num_messages ->
+  {:ok, connection} = AMQP.Connection.open()
+  {:ok, channel} = AMQP.Channel.open(connection)
+
+  1..num_messages
+  |> Enum.each(fn _ ->
+    event = Enum.random(["cinema", "musical", "play"])
+    user_id = Enum.random(1..3)
+
+    AMQP.Basic.publish(channel, "", "bookings_queue", "#{event},#{user_id}") |> IO.inspect()
+  end)
+
+  AMQP.Connection.close(connection)
+end
+```
+
+```elixir
+send_messages.(500)
+```
